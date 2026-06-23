@@ -1,0 +1,15 @@
+# Secret env files — real credentials live here. Templates (.env.example) are safe to commit.
+.env
+.env.local
+selfhost/.env
+
+# Service account identifier (not a credential, but identifying)
+service_account_details.txt
+
+service_account_details.txt
+*.json
+!package.json
+__pycache__/
+*.pyc
+.venv/
+*.wav

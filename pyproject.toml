@@ -1,0 +1,10 @@
+[project]
+name = "v2"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "livekit-agents[google,silero]>=1.6",
+    "livekit-api>=1.1.0",
+    "livekit-plugins-noise-cancellation~=0.2",
+    "python-dotenv>=1.2.2",
+]
