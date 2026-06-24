@@ -21,12 +21,25 @@ load_dotenv(".env.local")
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as _GAuthRequest
 
-from livekit.agents import Agent, AgentServer, AgentSession, cli, room_io
-from livekit.plugins import google, noise_cancellation, openai
+from livekit.agents import (
+    Agent,
+    AgentServer,
+    AgentSession,
+    JobContext,
+    JobProcess,
+    cli,
+    room_io,
+    stt as stt_module,
+)
+from livekit.plugins import google, noise_cancellation, openai, silero
 
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
 LOCATION = "us-central1"
 LLM_MODEL = "gemini-2.5-flash"
+
+# Self-hosted Whisper STT (faster-whisper, OpenAI-compatible) running on the VM.
+STT_BASE_URL = os.environ.get("STT_BASE_URL", "http://localhost:8001/v1")
+STT_MODEL = os.environ.get("STT_MODEL", "Systran/faster-whisper-small")
 
 TTS_BASE_URL = os.environ.get("TTS_BASE_URL", "http://localhost:8002/v1")
 # Must be "tts-1" (or "tts-1-hd"), NOT "kokoro". The openai TTS plugin routes only
@@ -51,6 +64,16 @@ except Exception as _e:
     print(f"[warn] credential pre-refresh failed: {_e}")
 
 
+def prewarm(proc: JobProcess) -> None:
+    """Load silero VAD ONCE per worker process, off the connect event loop.
+
+    Loading models inside the job entrypoint can freeze the event loop and break the
+    WebRTC connection (the lesson from v2/PROJECT_NOTES). Whisper is utterance-based, so
+    this VAD is also what segments speech for the STT StreamAdapter below.
+    """
+    proc.userdata["vad"] = silero.VAD.load()
+
+
 class VoiceAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
@@ -61,19 +84,23 @@ class VoiceAgent(Agent):
         )
 
 
-async def entrypoint(ctx):
-    # Pipeline mode (Step 1 — TTS replaced with self-hosted Kokoro):
-    #   - Google Cloud STT (streaming, via Vertex AI credentials) handles speech-to-text
-    #   - Google Gemini 2.5 Flash LLM (text model, via Vertex AI) handles reasoning
-    #   - Self-hosted Kokoro TTS (on VM GPU) handles text-to-speech
-    # Turn detection: LiveKit's default turn detector (silero VAD + model-based).
-    # This replaces only the TTS component with self-hosted; STT + LLM stay on Google.
+async def entrypoint(ctx: JobContext):
+    # Step 2 — self-hosted STT + TTS + local VAD; Gemini stays the LLM:
+    #   - faster-whisper STT (localhost, OpenAI-compatible) wrapped with StreamAdapter +
+    #     silero VAD (Whisper is utterance-based; VAD segments speech). Replaces Google STT
+    #     and removes the Singapore->US cloud round-trip (~0.5-0.8s -> ~0.2s).
+    #   - Gemini 2.5 Flash LLM (Vertex) handles reasoning — NOT self-hosted yet, by design.
+    #   - Self-hosted Kokoro TTS handles speech output.
+    vad = ctx.proc.userdata["vad"]
     session = AgentSession(
-        stt=google.STT(
-            languages="en-US",
-            model="latest_long",
-            location="global",
-            credentials_file=_SA_JSON,
+        vad=vad,
+        stt=stt_module.StreamAdapter(
+            stt=openai.STT(
+                model=STT_MODEL,
+                base_url=STT_BASE_URL,
+                api_key="local",
+            ),
+            vad=vad,
         ),
         llm=google.LLM(
             model=LLM_MODEL,
@@ -136,7 +163,7 @@ async def entrypoint(ctx):
     )
 
 
-server = AgentServer()
+server = AgentServer(setup_fnc=prewarm)
 
 
 @server.rtc_session()

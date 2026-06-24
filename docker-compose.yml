@@ -1,11 +1,35 @@
-# Step 1 — Kokoro TTS only (half-cascade with Gemini).
-# Gemini Live API handles audio input + reasoning; Kokoro handles speech output.
-# VM: NVIDIA L4 24GB. Kokoro uses ~1-2GB VRAM.
+# Step 2 — self-hosted STT (Whisper) + self-hosted TTS (Kokoro). Gemini stays the LLM.
+# Both servers are OpenAI-compatible and bound to localhost; the agent talks to them
+# over 127.0.0.1.  VM: NVIDIA L4 24GB.
 #   Start:  docker compose up -d
-#   Logs:   docker compose logs -f kokoro
+#   Logs:   docker compose logs -f whisper   (or kokoro)
 #   Stop:   docker compose down
+#
+# VRAM (L4 24GB): whisper small ~1-2GB | kokoro ~1-2GB  -> plenty of headroom.
 
 services:
+  # ---- STT: faster-whisper, OpenAI /v1/audio/transcriptions on :8001 ----
+  # Replaces Google Cloud STT -> removes the Singapore->US round-trip.
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cuda
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      # Preload so the first call isn't slow. Must match STT_MODEL in .env.local.
+      - WHISPER__MODEL=Systran/faster-whisper-small
+      - WHISPER__INFERENCE_DEVICE=cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ---- TTS: Kokoro-FastAPI, OpenAI /v1/audio/speech on :8002 ----
   kokoro:
     image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
     ports:
@@ -18,3 +42,6 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
+
+volumes:
+  hf-cache:
