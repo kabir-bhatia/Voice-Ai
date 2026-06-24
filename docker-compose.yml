@@ -1,15 +1,42 @@
-# Step 2 — self-hosted STT (Whisper) + self-hosted TTS (Kokoro). Gemini stays the LLM.
-# Both servers are OpenAI-compatible and bound to localhost; the agent talks to them
-# over 127.0.0.1.  VM: NVIDIA L4 24GB.
+# Step 3 — FULLY self-hosted: Whisper STT + Qwen LLM (vLLM) + Kokoro TTS. No Google.
+# All three servers are OpenAI-compatible and bound to localhost.  VM: NVIDIA L4 24GB.
 #   Start:  docker compose up -d
-#   Logs:   docker compose logs -f whisper   (or kokoro)
+#   Logs:   docker compose logs -f vllm   (first start downloads the LLM weights ~6GB)
 #   Stop:   docker compose down
 #
-# VRAM (L4 24GB): whisper small ~1-2GB | kokoro ~1-2GB  -> plenty of headroom.
+# VRAM budget on the 23GB L4 (approx):
+#   vLLM (Qwen2.5-7B AWQ + KV) ~12GB | whisper turbo ~2-3GB | kokoro ~1.5GB  -> fits.
 
 services:
+  # ---- LLM: vLLM serving Qwen2.5-7B (AWQ 4-bit), OpenAI /v1 on :8000 ----
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model Qwen/Qwen2.5-7B-Instruct-AWQ
+      --quantization awq_marlin
+      --max-model-len 8192
+      --gpu-memory-utilization 0.55
+      --enable-prefix-caching
+      --served-model-name qwen2.5-7b
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
   # ---- STT: faster-whisper, OpenAI /v1/audio/transcriptions on :8001 ----
-  # Replaces Google Cloud STT -> removes the Singapore->US round-trip.
+  # Upgraded small -> large-v3-turbo: much better accuracy, still low latency on the L4.
+  # Alternatives (just change WHISPER__MODEL here + STT_MODEL in .env.local):
+  #   distil-whisper (fastest whisper-family): Systran/faster-distil-whisper-large-v3
+  #   max accuracy:                            Systran/faster-whisper-large-v3
+  #   best-in-class (separate NeMo server, not this image): NVIDIA Parakeet TDT
   whisper:
     image: fedirz/faster-whisper-server:latest-cuda
     ports:
@@ -17,8 +44,7 @@ services:
     volumes:
       - hf-cache:/root/.cache/huggingface
     environment:
-      # Preload so the first call isn't slow. Must match STT_MODEL in .env.local.
-      - WHISPER__MODEL=Systran/faster-whisper-small
+      - WHISPER__MODEL=deepdml/faster-whisper-large-v3-turbo-ct2
       - WHISPER__INFERENCE_DEVICE=cuda
     deploy:
       resources:

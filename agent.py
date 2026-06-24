@@ -1,8 +1,6 @@
 import os
 import sys
 
-os.environ.pop("GOOGLE_API_KEY", None)
-
 if sys.platform == "win32":
     import platform as _platform
     import socket as _socket
@@ -18,9 +16,6 @@ from dotenv import load_dotenv
 
 load_dotenv(".env.local")
 
-from google.oauth2 import service_account
-from google.auth.transport.requests import Request as _GAuthRequest
-
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -31,15 +26,16 @@ from livekit.agents import (
     room_io,
     stt as stt_module,
 )
-from livekit.plugins import google, noise_cancellation, openai, silero
+from livekit.plugins import noise_cancellation, openai, silero
 
-PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-LOCATION = "us-central1"
-LLM_MODEL = "gemini-2.5-flash"
+# Self-hosted LLM (Qwen2.5-7B via vLLM, OpenAI-compatible) running on the VM.
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen2.5-7b")
 
 # Self-hosted Whisper STT (faster-whisper, OpenAI-compatible) running on the VM.
+# Default upgraded small -> large-v3-turbo for better accuracy (see docker-compose.yml).
 STT_BASE_URL = os.environ.get("STT_BASE_URL", "http://localhost:8001/v1")
-STT_MODEL = os.environ.get("STT_MODEL", "Systran/faster-whisper-small")
+STT_MODEL = os.environ.get("STT_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")
 
 TTS_BASE_URL = os.environ.get("TTS_BASE_URL", "http://localhost:8002/v1")
 # Must be "tts-1" (or "tts-1-hd"), NOT "kokoro". The openai TTS plugin routes only
@@ -48,21 +44,6 @@ TTS_BASE_URL = os.environ.get("TTS_BASE_URL", "http://localhost:8002/v1")
 # -> "no audio frames were pushed". Kokoro ignores the model field, so tts-1 is safe.
 TTS_MODEL = os.environ.get("TTS_MODEL", "tts-1")
 TTS_VOICE = os.environ.get("TTS_VOICE", "af_alloy")
-
-_SA_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-if not _SA_JSON or not os.path.isfile(_SA_JSON):
-    raise RuntimeError(
-        "GOOGLE_APPLICATION_CREDENTIALS not set or file missing. "
-        "Copy .env.example to .env.local and fill in the path to your service-account key."
-    )
-_CREDS = service_account.Credentials.from_service_account_file(
-    _SA_JSON, scopes=["https://www.googleapis.com/auth/cloud-platform"]
-)
-try:
-    _CREDS.refresh(_GAuthRequest())
-except Exception as _e:
-    print(f"[warn] credential pre-refresh failed: {_e}")
-
 
 def prewarm(proc: JobProcess) -> None:
     """Load silero VAD ONCE per worker process, off the connect event loop.
@@ -85,12 +66,10 @@ class VoiceAgent(Agent):
 
 
 async def entrypoint(ctx: JobContext):
-    # Step 2 — self-hosted STT + TTS + local VAD; Gemini stays the LLM:
-    #   - faster-whisper STT (localhost, OpenAI-compatible) wrapped with StreamAdapter +
-    #     silero VAD (Whisper is utterance-based; VAD segments speech). Replaces Google STT
-    #     and removes the Singapore->US cloud round-trip (~0.5-0.8s -> ~0.2s).
-    #   - Gemini 2.5 Flash LLM (Vertex) handles reasoning — NOT self-hosted yet, by design.
-    #   - Self-hosted Kokoro TTS handles speech output.
+    # Step 3 — FULLY self-hosted (no Google): all three models run on the VM, localhost.
+    #   - faster-whisper STT (large-v3-turbo) wrapped with StreamAdapter + silero VAD.
+    #   - Qwen2.5-7B LLM via vLLM (OpenAI-compatible) handles reasoning.
+    #   - Kokoro TTS handles speech output.
     vad = ctx.proc.userdata["vad"]
     session = AgentSession(
         vad=vad,
@@ -102,12 +81,10 @@ async def entrypoint(ctx: JobContext):
             ),
             vad=vad,
         ),
-        llm=google.LLM(
+        llm=openai.LLM(
             model=LLM_MODEL,
-            vertexai=True,
-            project=PROJECT_ID,
-            location=LOCATION,
-            credentials=_CREDS,
+            base_url=LLM_BASE_URL,
+            api_key="local",
             temperature=0.8,
         ),
         tts=openai.TTS(
