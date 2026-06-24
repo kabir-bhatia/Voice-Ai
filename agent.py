@@ -1,22 +1,18 @@
-import platform as _platform
-import socket as _socket
 import os
+import sys
 
-# Windows fix: importing aiohttp (a google-genai dependency) calls
-# platform.system(), which runs a WMI query that can hang on Python 3.13+
-# when the Windows WMI service is wedged. Pre-seed the uname cache so
-# the WMI query never fires. Must run BEFORE any LiveKit/Google imports.
-if getattr(_platform, "_uname_cache", None) is None:
-    try:
-        _platform._uname_cache = _platform.uname_result(
-            "Windows", _socket.gethostname(), "", "", ""
-        )
-    except Exception:
-        pass
-
-# Force Vertex AI auth path — remove any global GOOGLE_API_KEY so
-# LiveKit's Google plugin doesn't fall back to the Developer API.
 os.environ.pop("GOOGLE_API_KEY", None)
+
+if sys.platform == "win32":
+    import platform as _platform
+    import socket as _socket
+    if getattr(_platform, "_uname_cache", None) is None:
+        try:
+            _platform._uname_cache = _platform.uname_result(
+                "Windows", _socket.gethostname(), "", "", ""
+            )
+        except Exception:
+            pass
 
 from dotenv import load_dotenv
 
@@ -26,20 +22,20 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request as _GAuthRequest
 
 from livekit.agents import Agent, AgentServer, AgentSession, cli, room_io
-from livekit.plugins import google, noise_cancellation
+from livekit.plugins import google, noise_cancellation, openai
 
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
 LOCATION = "us-central1"
-MODEL = "gemini-live-2.5-flash-native-audio"
+LLM_MODEL = "gemini-2.5-flash"
 
-# Build the service-account credentials ONCE, up front, and pre-fetch the access
-# token. Why: inside the job subprocess the Gemini Live websocket has a hard-coded
-# 10s opening-handshake timeout (google-genai SDK). If credential discovery
-# (google.auth.default() re-scanning the JSON) and the OAuth token fetch happen on
-# the event loop *while* the LiveKit room is also connecting, they eat into that 10s
-# budget and the handshake times out (observed). Pre-resolving here removes auth from
-# the connect hot path. Passing credentials explicitly also stops the plugin from
-# calling google.auth.default() at all.
+TTS_BASE_URL = os.environ.get("TTS_BASE_URL", "http://localhost:8002/v1")
+# Must be "tts-1" (or "tts-1-hd"), NOT "kokoro". The openai TTS plugin routes only
+# tts-1/tts-1-hd through the raw-audio path (iter_bytes); every other model name goes
+# through the SSE path, which expects "data:" events that Kokoro-FastAPI does not emit
+# -> "no audio frames were pushed". Kokoro ignores the model field, so tts-1 is safe.
+TTS_MODEL = os.environ.get("TTS_MODEL", "tts-1")
+TTS_VOICE = os.environ.get("TTS_VOICE", "af_alloy")
+
 _SA_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 if not _SA_JSON or not os.path.isfile(_SA_JSON):
     raise RuntimeError(
@@ -50,8 +46,8 @@ _CREDS = service_account.Credentials.from_service_account_file(
     _SA_JSON, scopes=["https://www.googleapis.com/auth/cloud-platform"]
 )
 try:
-    _CREDS.refresh(_GAuthRequest())  # warm the token off the handshake critical path
-except Exception as _e:  # non-fatal; the SDK will refresh on demand
+    _CREDS.refresh(_GAuthRequest())
+except Exception as _e:
     print(f"[warn] credential pre-refresh failed: {_e}")
 
 
@@ -66,27 +62,51 @@ class VoiceAgent(Agent):
 
 
 async def entrypoint(ctx):
+    # Pipeline mode (Step 1 — TTS replaced with self-hosted Kokoro):
+    #   - Google Cloud STT (streaming, via Vertex AI credentials) handles speech-to-text
+    #   - Google Gemini 2.5 Flash LLM (text model, via Vertex AI) handles reasoning
+    #   - Self-hosted Kokoro TTS (on VM GPU) handles text-to-speech
+    # Turn detection: LiveKit's default turn detector (silero VAD + model-based).
+    # This replaces only the TTS component with self-hosted; STT + LLM stay on Google.
     session = AgentSession(
-        llm=google.realtime.RealtimeModel(
-            model=MODEL,
+        stt=google.STT(
+            languages="en-US",
+            model="latest_long",
+            location="global",
+            credentials_file=_SA_JSON,
+        ),
+        llm=google.LLM(
+            model=LLM_MODEL,
             vertexai=True,
             project=PROJECT_ID,
             location=LOCATION,
-            credentials=_CREDS,   # explicit -> skips google.auth.default() discovery
-            voice="Puck",
+            credentials=_CREDS,
             temperature=0.8,
         ),
-        # CRITICAL: turn_detection=None. If omitted, AgentSession defaults to
-        # inference.TurnDetector() (agent_session.py:366), which loads an ML model
-        # ON the event loop during startup and blocks it for ~6s ("job executor
-        # unresponsive"), which in turn makes the WebRTC media connection time out
-        # ("wait_pc_connection timed out") and the whole session crawl. Gemini
-        # native-audio does turn detection server-side, so we don't need a local one.
-        turn_detection=None,
+        tts=openai.TTS(
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            api_key="not-needed",
+            base_url=TTS_BASE_URL,
+            # pcm (raw 24kHz) — NOT wav. The plugin frames the bytes as
+            # audio/<response_format> at SAMPLE_RATE=24000; a streaming WAV container
+            # fails to decode ("no audio frames were pushed"), while raw PCM at 24kHz
+            # (Kokoro's native rate) streams cleanly. See tts.py:250 / SAMPLE_RATE.
+            response_format="pcm",
+        ),
+        # LATENCY (Lever 1): cap how long the agent waits after you stop speaking.
+        # The dominant latency was the turn-detector's endpointing wait: when it isn't
+        # confident you're done it waits the full max_delay (default 2.5s for model mode),
+        # which made slow turns ~2.7-3.2s. Capping max_delay to 1.2s drops those to
+        # ~1.2-1.7s. min_delay 0.3 keeps fast turns snappy. Tune by ear: raise max_delay
+        # if it interrupts you mid-sentence; lower it if replies still feel laggy.
+        # (Plain-dict form; other turn_handling keys — incl. preemptive_generation — keep
+        # their defaults, so preemptive generation stays on.)
+        turn_handling={
+            "endpointing": {"min_delay": 0.3, "max_delay": 1.2},
+        },
     )
 
-    # Diagnostic logging: print whenever the agent hears the user or speaks.
-    # If you SEE "USER SAID" lines when you talk, your mic IS reaching the agent.
     from livekit.agents import (
         UserInputTranscribedEvent,
         ConversationItemAddedEvent,
@@ -98,7 +118,10 @@ async def entrypoint(ctx):
 
     @session.on("conversation_item_added")
     def _on_item(ev: ConversationItemAddedEvent):
-        print(f"\n[{ev.item.role.upper()}] {ev.item.text_content!r}")
+        role = getattr(ev.item, "role", None)
+        if role is None:
+            return
+        print(f"\n[{role.upper()}] {ev.item.text_content!r}")
 
     await session.start(
         agent=VoiceAgent(),
@@ -108,8 +131,6 @@ async def entrypoint(ctx):
         ),
     )
 
-    # Speak first, so we can verify the audio-OUT path independently of the mic.
-    # If you HEAR this greeting, output + Gemini work and only mic input is suspect.
     await session.generate_reply(
         instructions="Greet the user warmly in one short sentence and ask how you can help."
     )
@@ -118,10 +139,6 @@ async def entrypoint(ctx):
 server = AgentServer()
 
 
-# No agent_name -> automatic dispatch: the worker is offered every new room on the
-# project and joins it. Simplest reliable behavior for a single-user demo (no token
-# dispatch config, no room-name coordination, no stale-room gotcha). For production /
-# multi-agent routing, set agent_name=... here to switch back to explicit dispatch.
 @server.rtc_session()
 async def _entrypoint(ctx):
     await entrypoint(ctx)

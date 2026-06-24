@@ -1,0 +1,20 @@
+# Step 1 — Kokoro TTS only (half-cascade with Gemini).
+# Gemini Live API handles audio input + reasoning; Kokoro handles speech output.
+# VM: NVIDIA L4 24GB. Kokoro uses ~1-2GB VRAM.
+#   Start:  docker compose up -d
+#   Logs:   docker compose logs -f kokoro
+#   Stop:   docker compose down
+
+services:
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-gpu:latest
+    ports:
+      - "127.0.0.1:8002:8880"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
