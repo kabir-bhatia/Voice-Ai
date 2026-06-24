@@ -43,7 +43,7 @@ TTS_BASE_URL = os.environ.get("TTS_BASE_URL", "http://localhost:8002/v1")
 # through the SSE path, which expects "data:" events that Kokoro-FastAPI does not emit
 # -> "no audio frames were pushed". Kokoro ignores the model field, so tts-1 is safe.
 TTS_MODEL = os.environ.get("TTS_MODEL", "tts-1")
-TTS_VOICE = os.environ.get("TTS_VOICE", "af_alloy")
+TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")  # warmer than af_alloy; tested good
 
 def prewarm(proc: JobProcess) -> None:
     """Load silero VAD ONCE per worker process, off the connect event loop.
