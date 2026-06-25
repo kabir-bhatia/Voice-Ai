@@ -13,3 +13,7 @@ __pycache__/
 *.pyc
 .venv/
 *.wav
+
+# Internal working notes — kept local, not published
+PROJECT_NOTES.md
+STATUS_AND_ISSUES.md
