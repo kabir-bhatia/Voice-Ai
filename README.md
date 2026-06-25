@@ -20,6 +20,9 @@ Agent worker  (agent.py, this repo)
 All three model servers are OpenAI-compatible and bound to `localhost`; the agent talks
 to them over `127.0.0.1`.
 
+> 📐 **[ARCHITECTURE.md](ARCHITECTURE.md)** — detailed component + data-flow breakdown,
+> and why the LLM is hosted with **vLLM** (not Ollama).
+
 ---
 
 ## Requirements (read this first)
